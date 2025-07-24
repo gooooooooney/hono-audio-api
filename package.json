@@ -1,0 +1,31 @@
+{
+  "name": "server",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "check-types": "tsc -b",
+    "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@gooney-001/ten-vad-lib": "^1.0.1",
+    "@hono/node-server": "^1.14.4",
+    "@hono/swagger-ui": "^0.5.2",
+    "@hono/zod-openapi": "^1.0.2",
+    "@orpc/client": "^1.5.0",
+    "@orpc/server": "^1.5.0",
+    "dotenv": "^16.4.7",
+    "hono": "^4.8.2",
+    "openai": "^5.10.2",
+    "undici": "^7.12.0",
+    "zod": "^4.0.2"
+  },
+  "devDependencies": {
+    "tsdown": "^0.12.9",
+    "typescript": "^5.8.2",
+    "tsx": "^4.19.2",
+    "@types/node": "^22.13.11"
+  }
+}
