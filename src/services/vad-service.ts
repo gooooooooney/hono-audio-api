@@ -146,6 +146,13 @@ export class VADService {
     );
     
     // Filter speech segments
+    console.log(`Filtering segments with minDurationMs=${minDurationMs}, minProbability=${minProbability}`);
+    console.log(`Original segments:`, vadResult.segments.map(s => ({
+      duration: ((s.endTime - s.startTime) * 1000).toFixed(1) + 'ms',
+      probability: s.probability.toFixed(3),
+      isSpeech: s.isSpeech
+    })));
+    
     const filteredSegments = AudioService.filterSpeechSegments(
       vadResult.segments,
       minDurationMs,

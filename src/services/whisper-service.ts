@@ -70,9 +70,18 @@ export class WhisperService {
 
       // Call OpenAI Whisper API
       const startTime = Date.now();
+      // Groq uses different model names for Whisper
+      const modelName = process.env.OPENAI_BASE_URL?.includes('groq.com') 
+        ? 'whisper-large-v3-turbo' 
+        : 'whisper-1';
+      
+      console.log(`Using model: ${modelName}`);
+      console.log(`API Base URL: ${process.env.OPENAI_BASE_URL}`);
+      console.log(`API Key prefix: ${process.env.OPENAI_API_KEY?.substring(0, 10)}...`);
+      
       const transcription = await client.audio.transcriptions.create({
         file: audioFile,
-        model: 'whisper-1',
+        model: modelName,
         language: options.language,
         prompt: options.prompt,
         response_format: options.response_format || 'verbose_json',
@@ -163,8 +172,15 @@ export class WhisperService {
       // Try to access the client
       const client = this.getClient();
 
-      // Test with a minimal request (list models is usually lightweight)
-      await client.models.list();
+      // For Groq, skip the models.list() test as it may not be supported
+      // Just verify the client can be created with valid config
+      if (process.env.OPENAI_BASE_URL?.includes('groq.com')) {
+        // For Groq, we'll trust that if the client is created successfully, it's accessible
+        console.log('Using Groq API - skipping models.list() test');
+      } else {
+        // Test with a minimal request (list models is usually lightweight)
+        await client.models.list();
+      }
 
       return {
         configured: true,

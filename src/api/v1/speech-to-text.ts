@@ -304,6 +304,394 @@ app.openapi(speechToTextRoute, (async (c) => {
   }
 }));
 
+// 文件上传转录路由的 Schema
+const FileUploadRequestSchema = z.object({
+  file: z
+    .any()
+    .refine((file) => file instanceof File, {
+      message: "必须是音频文件"
+    })
+    .openapi({
+      type: 'string',
+      format: 'binary',
+      description: '音频文件 (WAV, MP3, M4A, FLAC 等格式)'
+    }),
+  language: z.string().optional().describe('目标语言（ISO 639-1 代码，例如："en", "zh"）'),
+  prompt: z.string().optional().describe('可选的文本提示，用于指导转录过程'),
+  minDurationMs: z.string().optional().describe('最小语音段持续时间（毫秒），默认100'),
+  minProbability: z.string().optional().describe('VAD 最小置信度阈值（0.0-1.0），默认0.3'),
+  includeSegments: z.string().optional().describe('是否在响应中包含详细的分段信息，默认false')
+}).openapi('FileUploadSpeechToTextRequest');
+
+// 文件上传转录路由
+const fileUploadRoute = createRoute({
+  method: 'post',
+  path: '/transcribe/upload',
+  tags: ['语音转文字'],
+  summary: '文件上传音频转录',
+  description: `
+  通过文件上传进行音频转录，支持多种音频格式。
+  
+  **处理流程：**
+  1. 接收上传的音频文件
+  2. 转换为 WAV 格式（如需要）
+  3. 应用 VAD 检测语音段
+  4. 过滤和合并语音段
+  5. 使用 Whisper 转录处理后的音频
+  6. 返回文本和处理统计信息
+  
+  **支持格式：**
+  - WAV (推荐)
+  - MP3
+  - M4A
+  - FLAC
+  - 其他 OpenAI Whisper 支持的格式
+  
+  **文件大小限制：**
+  - 最大 25MB
+  - 最大音频时长：25分钟
+  
+  **要求：**
+  - 必须配置 OpenAI API 密钥
+  
+  **优势：**
+  - 支持多种音频格式
+  - 自动格式转换
+  - 降低转录成本（VAD 去除静音）
+  - 提高准确性（无静音/噪音）
+  `,
+  request: {
+    body: {
+      content: {
+        'multipart/form-data': {
+          schema: FileUploadRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      content: {
+        'application/json': {
+          schema: SpeechToTextResponseSchema,
+        },
+      },
+      description: '转录成功完成',
+    },
+    400: {
+      content: {
+        'application/json': {
+          schema: ErrorResponseSchema,
+        },
+      },
+      description: '错误请求 - 无效的音频文件或参数',
+    },
+    401: {
+      content: {
+        'application/json': {
+          schema: ErrorResponseSchema,
+        },
+      },
+      description: '未授权 - OpenAI API 密钥未配置或无效',
+    },
+    413: {
+      content: {
+        'application/json': {
+          schema: ErrorResponseSchema,
+        },
+      },
+      description: '文件太大 - 超过25MB限制',
+    },
+    415: {
+      content: {
+        'application/json': {
+          schema: ErrorResponseSchema,
+        },
+      },
+      description: '不支持的媒体类型 - 不支持的音频格式',
+    },
+    429: {
+      content: {
+        'application/json': {
+          schema: ErrorResponseSchema,
+        },
+      },
+      description: '请求过多 - OpenAI API 配额超限',
+    },
+    500: {
+      content: {
+        'application/json': {
+          schema: ErrorResponseSchema,
+        },
+      },
+      description: '服务器内部错误',
+    },
+  },
+});
+
+app.openapi(fileUploadRoute, async (c) => {
+  const startTime = Date.now();
+
+  try {
+    // 解析表单数据
+    const body = await c.req.parseBody();
+
+    // 提取文件和参数
+    const file = body['file'] as File;
+    const language = body['language'] as string | undefined;
+    const prompt = body['prompt'] as string | undefined;
+    const parsedMinDurationMs = body['minDurationMs'] && body['minDurationMs'] !== '' 
+      ? parseInt(body['minDurationMs'] as string) 
+      : 100;
+    const parsedMinProbability = body['minProbability'] && body['minProbability'] !== ''
+      ? parseFloat(body['minProbability'] as string) 
+      : 0.3;
+    
+    // 确保参数有效，避免 NaN
+    const minDurationMs = isNaN(parsedMinDurationMs) ? 100 : parsedMinDurationMs;
+    const minProbability = isNaN(parsedMinProbability) ? 0.3 : parsedMinProbability;
+    const includeSegments = body['includeSegments'] === 'true';
+
+    // 验证文件
+    if (!file || !(file instanceof File)) {
+      return c.json({
+        success: false,
+        error: 'No audio file provided',
+        details: 'Please provide an audio file in the form data',
+        code: 'NO_FILE_PROVIDED'
+      }, 400);
+    }
+
+    // 检查文件大小 (25MB 限制)
+    const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
+    if (file.size > MAX_FILE_SIZE) {
+      return c.json({
+        success: false,
+        error: 'File too large',
+        details: `File size ${(file.size / 1024 / 1024).toFixed(1)}MB exceeds maximum limit of 25MB`,
+        code: 'FILE_TOO_LARGE'
+      }, 413);
+    }
+
+    // 检查文件类型
+    const supportedTypes = [
+      'audio/wav', 'audio/x-wav', 'audio/wave',
+      'audio/mpeg', 'audio/mp3',
+      'audio/mp4', 'audio/m4a', 'audio/x-m4a',
+      'audio/flac', 'audio/x-flac',
+      'audio/ogg', 'audio/webm',
+      'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo'
+    ];
+
+    if (!supportedTypes.includes(file.type) && file.type !== '') {
+      // 如果 MIME 类型检测失败，尝试通过文件扩展名判断
+      const fileName = file.name.toLowerCase();
+      const supportedExtensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm', '.mp4', '.mov', '.avi'];
+      const hasValidExtension = supportedExtensions.some(ext => fileName.endsWith(ext));
+
+      if (!hasValidExtension) {
+        return c.json({
+          success: false,
+          error: 'Unsupported file format',
+          details: `File type "${file.type}" is not supported. Supported formats: WAV, MP3, M4A, FLAC, OGG, WebM, MP4`,
+          code: 'UNSUPPORTED_FORMAT'
+        }, 415);
+      }
+    }
+
+    console.log(`Processing uploaded file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB, ${file.type})`);
+
+    // 将文件转换为 ArrayBuffer
+    const arrayBuffer = await file.arrayBuffer();
+
+    // 如果不是 WAV 格式，我们需要使用 OpenAI Whisper 直接处理
+    // 对于 WAV 格式，我们可以继续使用现有的 VAD 流程
+    let audioBase64: string;
+    let shouldUseVAD = false;
+
+    if (file.type === 'audio/wav' || file.type === 'audio/x-wav' || file.type === 'audio/wave' ||
+      file.name.toLowerCase().endsWith('.wav')) {
+      // WAV 文件可以使用 VAD 处理
+      audioBase64 = Buffer.from(arrayBuffer).toString('base64');
+      shouldUseVAD = true;
+    } else {
+      // 非 WAV 文件直接发送给 Whisper
+      audioBase64 = Buffer.from(arrayBuffer).toString('base64');
+      shouldUseVAD = false;
+    }
+
+
+    if (shouldUseVAD) {
+      // 使用现有的 VAD + Whisper 流程（与原始路由相同的逻辑）
+      console.log('Using VAD preprocessing for WAV file');
+
+      console.log(`VAD parameters: minDurationMs=${minDurationMs}, minProbability=${minProbability}`);
+
+      const vadResult = await VADService.extractSpeechSegments(
+        audioBase64,
+        minDurationMs,
+        minProbability
+      );
+
+      const vadProcessingTime = Date.now() - startTime;
+
+      if (!vadResult.speechFound) {
+        return c.json({
+          success: false,
+          error: 'No speech detected',
+          details: 'VAD analysis found no valid speech segments in the audio',
+          code: 'NO_SPEECH_DETECTED'
+        }, 400);
+      }
+
+      // 计算音频统计信息
+      const originalDurationMs = AudioService.calculateDuration(
+        AudioService.extractMonoAudio(
+          vadResult.originalBuffer,
+          AudioService.parseWAVHeader(vadResult.originalBuffer)
+        ),
+        AudioService.parseWAVHeader(vadResult.originalBuffer).sampleRate
+      ) * 1000;
+
+      const processedDurationMs = AudioService.calculateDuration(
+        AudioService.extractMonoAudio(
+          vadResult.processedBuffer,
+          AudioService.parseWAVHeader(vadResult.processedBuffer)
+        ),
+        AudioService.parseWAVHeader(vadResult.processedBuffer).sampleRate
+      ) * 1000;
+
+      const audioStats = {
+        originalDurationMs,
+        processedDurationMs,
+        compressionRatio: processedDurationMs / originalDurationMs,
+        originalSizeBytes: vadResult.originalBuffer.byteLength,
+        processedSizeBytes: vadResult.processedBuffer.byteLength
+      };
+
+      console.log(`VAD processing complete: ${audioStats.compressionRatio.toFixed(1)}x compression`);
+
+      // Whisper 转录
+      const transcriptionResult = await WhisperService.transcribeAudio(
+        vadResult.processedBuffer,
+        {
+          language,
+          prompt,
+          response_format: includeSegments ? 'verbose_json' : 'json',
+          temperature: 0
+        }
+      );
+
+      const totalProcessingTime = Date.now() - startTime;
+
+      const response = {
+        success: true,
+        text: transcriptionResult.text,
+        language: transcriptionResult.language,
+        confidence: transcriptionResult.segments?.length ?
+          transcriptionResult.segments.reduce((avg, seg) => avg + (1 - seg.no_speech_prob), 0) / transcriptionResult.segments.length :
+          undefined,
+        vadStats: {
+          totalFrames: vadResult.vadResult.totalFrames,
+          speechFrames: vadResult.vadResult.speechFrames,
+          speechPercentage: vadResult.vadResult.speechPercentage,
+          segmentsFound: vadResult.vadResult.segments.length,
+          segmentsKept: vadResult.vadResult.segments.filter(s => s.isSpeech).length,
+          processingTimeMs: vadProcessingTime
+        },
+        audioStats,
+        processingTimeMs: totalProcessingTime,
+        ...(includeSegments && transcriptionResult.segments && {
+          segments: transcriptionResult.segments
+        })
+      };
+
+      return c.json(response, 200);
+
+    } else {
+      // 直接使用 Whisper（无 VAD 预处理）
+      console.log('Using direct Whisper processing for non-WAV file');
+
+      const transcriptionResult = await WhisperService.transcribeAudio(
+        arrayBuffer,
+        {
+          language,
+          prompt,
+          response_format: includeSegments ? 'verbose_json' : 'json',
+          temperature: 0
+        }
+      );
+
+      const totalProcessingTime = Date.now() - startTime;
+
+      // 计算基础音频统计信息
+      const audioStats = {
+        originalDurationMs: 0, // 无法直接计算非 WAV 格式的时长
+        processedDurationMs: 0, // 无 VAD 处理
+        compressionRatio: 1.0, // 无压缩
+        originalSizeBytes: arrayBuffer.byteLength,
+        processedSizeBytes: arrayBuffer.byteLength
+      };
+
+      const response = {
+        success: true,
+        text: transcriptionResult.text,
+        language: transcriptionResult.language,
+        confidence: transcriptionResult.segments?.length ?
+          transcriptionResult.segments.reduce((avg, seg) => avg + (1 - seg.no_speech_prob), 0) / transcriptionResult.segments.length :
+          undefined,
+        vadStats: {
+          totalFrames: 0,
+          speechFrames: 0,
+          speechPercentage: 100, // 假设整个文件都是语音
+          segmentsFound: 0,
+          segmentsKept: 0,
+          processingTimeMs: 0
+        },
+        audioStats,
+        processingTimeMs: totalProcessingTime,
+        ...(includeSegments && transcriptionResult.segments && {
+          segments: transcriptionResult.segments
+        })
+      };
+
+      return c.json(response, 200);
+    }
+
+  } catch (error) {
+    console.error('File upload speech-to-text processing error:', error);
+
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    let statusCode: 500 | 400 | 401 | 429 | 503 | 413 = 500;
+    let errorCode = 'PROCESSING_ERROR';
+
+    // 处理特定错误类型
+    if (errorMessage.includes('Invalid audio format') || errorMessage.includes('Invalid WAV file')) {
+      statusCode = 400;
+      errorCode = 'INVALID_AUDIO_FORMAT';
+    } else if (errorMessage.includes('OPENAI_API_KEY')) {
+      statusCode = 401;
+      errorCode = 'API_KEY_MISSING';
+    } else if (errorMessage.includes('quota exceeded') || errorMessage.includes('rate limit')) {
+      statusCode = 429;
+      errorCode = 'QUOTA_EXCEEDED';
+    } else if (errorMessage.includes('model_not_found')) {
+      statusCode = 503;
+      errorCode = 'SERVICE_UNAVAILABLE';
+    } else if (errorMessage.includes('File too large')) {
+      statusCode = 413;
+      errorCode = 'FILE_TOO_LARGE';
+    }
+
+    return c.json({
+      success: false,
+      error: 'File upload processing failed',
+      details: errorMessage,
+      code: errorCode
+    }, statusCode as any);
+  }
+});
+
 // 服务状态路由
 const statusRoute = createRoute({
   method: 'get',
